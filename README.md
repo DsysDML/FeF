@@ -14,6 +14,7 @@ To set up the environment variables, add the following lines to the .bashrc file
 ```bash
 export PATH=${PATH}:/installation_path/RBM-Proteins
 export RBMHOME=/installation_path/RBM-Proteins
+```
 
 ## Training RBMs
 
