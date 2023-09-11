@@ -1,9 +1,11 @@
 import torch
+from torch.distributions import Categorical
 from torch.utils.data import DataLoader
 import h5py
 import numpy as np
+import sys
 import os
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import time
 import datetime
 
@@ -12,6 +14,7 @@ class RBM:
     def __init__(self,
                 num_visible=0,                  # Number or visisble variables
                 num_hidden=0,                   # Number of hidden variables
+                num_categ=0,                    # Number of labelled categories
                 device= torch.device('cpu'),    # CPU or GPU?
                 var_init=1e-4,                  # Variance of the initial weights
                 dtype=torch.float32):           # Data type used during computations
@@ -19,6 +22,7 @@ class RBM:
         # structure-specific variables
         self.Nv = num_visible        
         self.Nh = num_hidden
+        self.num_categ = num_categ
         self.device = device
         self.dtype = dtype
         self.var_init = var_init
@@ -29,6 +33,7 @@ class RBM:
         self.gibbs_steps = 0
         self.num_pcd = 0
         self.lr = 0
+        self.lr_labels = 0
         self.ep_max = 0
         self.ep_start = 0 # epoch to start with, used for restoring the training
         self.mb_s = 0
@@ -39,25 +44,35 @@ class RBM:
         self.up_tot = 0
         self.list_save_rbm = []        
         self.time_start = 0
-        self.training_time = 0
+        self.training_time = 0  
+        self.partial_labels = True
+        self.lab_frac = 0.
         self.continuous_dataset = False
+        self.L1_reg = 0
+        self.L2_reg = 0
         
         # weights of the RBM
         self.W = torch.randn(size=(self.Nv, self.Nh), device=self.device, dtype=self.dtype) * self.var_init
+        self.D = torch.randn(size=(self.num_categ, self.Nh), device=self.device, dtype=self.dtype) * self.var_init
         # visible and hidden biases
         self.vbias = torch.zeros(self.Nv, device=self.device, dtype=self.dtype)
         self.hbias = torch.zeros(self.Nh, device=self.device, dtype=self.dtype)
+        self.lbias = torch.zeros((self.num_categ,), device=self.device, dtype=self.dtype)
         # permanent chain
         self.X_pc = None
-        # averages used to center the gradient
+        self.l_pc = None
         self.visDataAv = torch.tensor([0])
         self.hidDataAv = torch.tensor([0])
+        self.labDataAv = torch.tensor([0])
         
         # identity variables
         self.dataset_filename = ''
         timestamp = str('.'.join(list(str(time.localtime()[i]) for i in range(5))))
-        self.model_stamp = f'BernoulliBernoulliRBM-{timestamp}'
+        self.model_stamp = f'BernoulliBernoulliSslRBM-{timestamp}'
         self.file_stamp = ''
+        
+        # auxiliary variables
+        self.all_categ = torch.arange(self.num_categ, device=self.device).reshape(-1, 1)
         
         # constants
         self.eps = 1e-7 # precision for clamping values
@@ -83,25 +98,34 @@ class RBM:
             stamp = str(alltime[idx])
         self.t_age = stamp
 
-        self.W = torch.tensor(np.array(f['W' + stamp]), dtype=self.dtype); 
-        self.vbias = torch.tensor(np.array(f['vbias' + stamp]), dtype=self.dtype)
-        self.hbias = torch.tensor(np.array(f['hbias' + stamp]), dtype=self.dtype) 
+        self.W = torch.tensor(np.array(f['W' + stamp])); 
+        self.D = torch.tensor(np.array(f['D' + stamp])); 
+        self.vbias = torch.tensor(np.array(f['vbias' + stamp]))
+        self.hbias = torch.tensor(np.array(f['hbias' + stamp]))
+        self.lbias = torch.tensor(np.array(f['lbias' + stamp]))
         self.Nv = self.W.shape[0]
         self.Nh = self.W.shape[1]
+        self.num_categ = self.D.shape[0]
+        self.all_categ = torch.arange(self.num_categ, device=self.device).reshape(-1, 1)
         self.gibbs_steps = f['NGibbs'][()]
         self.var_init = f['var_init'][()]
         self.num_pcd = f['numPCD'][()]
         self.lr = f['lr'][()]
+        self.lr_labels = f['lr_labels'][()]
         self.ep_max = f['ep_max'][()]
         self.mb_s = f['miniBatchSize'][()]
         self.ep_tot = f['ep_tot'][()]
         self.up_tot = f['up_tot'][()]
+        self.L1_reg = f['L1_reg'][()]
+        self.L2_reg = f['L2_reg'][()]
         self.list_save_rbm = f['alltime'][()]
         self.file_stamp = f['file_stamp'][()].decode('utf-8')
         self.updCentered = f['updCentered'][()]
         self.UpdByEpoch = f['UpdByEpoch'][()]
         self.dataset_filename = f['dataset_filename'][()].decode('utf8')
         self.model_stamp = f['model_stamp'][()].decode('utf8')
+        self.partial_labels = bool(f['partial_labels'][()])
+        self.lab_frac = f['lab_frac'][()]
         self.training_time = f['training_time'][()]
         self.time_start = f['time_start'][()]
         self.seed = f['seed'][()]
@@ -117,58 +141,63 @@ class RBM:
         elif self.training_mode == 'PCD':
             self.CDLearning = False
             self.ResetPermChainBatch = False
-            self.X_pc = torch.tensor(np.array(f['X_pc']))
+            self.X_pc = torch.tensor(np.array(f['X_pc' + stamp]))
+            self.l_pc = torch.tensor(np.array(f['L_pc' + stamp]))
         else:
             self.CDLearning = True
             self.ResetPermChainBatch = False # this has no actual effect with CD
         
         if self.device.type != 'cpu':
             self.W = self.W.to(self.device)
+            self.D = self.D.to(self.device)
             self.vbias = self.vbias.to(self.device)
             self.hbias = self.hbias.to(self.device)
+            self.lbias = self.lbias.to(self.device)
             if self.training_mode == 'PCD':
                 self.X_pc = self.X_pc.to(self.device)
+                self.l_pc = self.l_pc.to(self.device)
     
-    def compute_energy(self, V : torch.Tensor, H : torch.Tensor) -> torch.Tensor:
-        """Computes the Hamiltonian on the visible (V) and hidden (H) variables.
+    def compute_energy(self, V : torch.Tensor, H : torch.Tensor, L : torch.Tensor) -> torch.Tensor:
+        """Computes the Hamiltonian on the visible (V), hidden (H), and label (L) variables.
 
         Args:
-            V (torch.Tensor): Visible units.
-            H (torch.Tensor): Hidden units.
+            V (torch.Tensor): Visible variables.
+            H (torch.Tensor): Hidden Variables.
+            L (torch.Tensor): Labels.
 
         Returns:
             torch.Tensor: Energy of the data points.
         """
 
-        fields = torch.tensordot(self.vbias, V, dims=[[0], [1]]) + torch.tensordot(self.hbias, H, dims=[[0], [1]])
-        interaction = torch.multiply(V, torch.tensordot(H, self.W, dims=[[1], [1]])).sum(1)
+        fields = torch.tensordot(self.vbias, V, dims=[[0], [1]]) + torch.tensordot(self.hbias, H, dims=[[0], [1]]) + self.lbias[L]
+        interaction = torch.multiply(V, torch.tensordot(H, self.W, dims=[[1], [1]])) + torch.multiply(H, self.D[L, :]).sum(1)
 
         return - fields - interaction
     
-    def compute_energy_visibles(self, V : torch.Tensor) -> torch.Tensor:
-        """Computes the Hamiltonian on the visible variables only.
+    def compute_energy_visibles(self, V : torch.Tensor, L : torch.Tensor) -> torch.Tensor:
+        """Computes the unnormalized Log-Likelihood of the single data points.
 
         Args:
             V (torch.Tensor): Visible units.
+            L (torch.Tensor): Labels associated to the data.
 
         Returns:
             torch.Tensor: Energy of the data points.
         """
 
-        field = torch.tensordot(V, self.vbias, dims=[[1], [0]])
-        exponent = self.hbias + torch.tensordot(V, self.W, dims=[[1], [0]]) # (Ns, Nh)
-        idx = exponent < 10
-        log_term = exponent.clone()
-        log_term[idx] = torch.log(1 + torch.exp(exponent[idx]))
-        energy = - field - log_term.sum(1)
-
-        return energy
+        fields = torch.tensordot(V, self.vbias, dims=[[1], [0]]) + self.lbias[L]
+        I_ml = self.hbias.reshape(1, self.Nh) + torch.tensordot(V, self.W, dims=[[1], [0]]) + self.D[L]# (Ns, Nh)
+        log_term = I_ml.clone()
+        idx = I_ml < 10
+        log_term[idx] = torch.log(1. + torch.exp(I_ml[idx]))
+        E = - fields.type(torch.float64) - log_term.sum(1) # (Ns,)
+        
+        return E
     
-    def compute_partition_function_AIS(self, V : torch.tensor, n_beta : int) -> float:
+    def compute_partition_function_AIS(self, n_beta : int) -> float:
         """Estimates the partition function of the model using Annealed Importance Sampling.
 
         Args:
-            V (torch.Tensor): Input data to estimate the fields of the independent-site model.
             n_beta (int): Number of inverse temperatures that define the trajectories.
 
         Returns:
@@ -176,21 +205,6 @@ class RBM:
         """
         
         # define the energy of the prior pdf over the visible units (independent-site model)
-        #def compute_energy_prior(V : torch.Tensor) -> list:
-        #    """Returns the energy function of an independent-site model over the visible variables.
-#
-        #    Args:
-        #        V (torch.Tensor): Visible data.
-#
-        #    Returns:
-        #        list: prior_biases, prior_energy, prior logZ
-        #    """
-        #    eps = 1e-7
-        #    freq = torch.clamp(V.mean(0), min=eps, max=1. - eps)
-        #    vbias0 = torch.log(freq) - torch.log(1. - freq)
-        #    energy0 = - torch.tensordot(V, vbias0, dims=[[1], [0]])
-#
-        #    return vbias0, energy0
         
         n_chains = self.num_pcd
         E = torch.zeros(n_chains, device=self.device, dtype=torch.float64)
@@ -218,11 +232,12 @@ class RBM:
         
         return logZ
 
-    def sampleHiddens(self, V : torch.Tensor, beta=1.) -> list:
+    def sampleHiddens(self, V : torch.Tensor, L : torch.Tensor, beta=1.) -> list:
         """Samples the hidden variables by performing one block Gibbs sampling step.
 
         Args:
             V (torch.Tensor): Visible units.
+            L (torch.Tensor): Labels.
             beta (float, optional): Inverse temperature. Defaults to 1.
 
         Returns:
@@ -230,7 +245,7 @@ class RBM:
         """
 
         # V is a batch of size (Ns, Nv)        
-        I = torch.tensordot(V, self.W, dims=[[1], [0]]) # (Ns, Nh)
+        I = torch.tensordot(V, self.W, dims=[[1], [0]]) + self.D[L, :]# (Ns, Nh)
         mh = torch.sigmoid(beta * (self.hbias + I))
         h = torch.bernoulli(mh)
 
@@ -254,30 +269,117 @@ class RBM:
 
         return v, mv
     
-    def getAv(self) -> list:
-        """Performs it_mcmc Gibbs steps. Used for the training.
+    def sampleLabels(self, H : torch.Tensor, beta=1.) -> list:
+        """Samples the label variables by performing one block Gibbs sampling step.
+
+        Args:
+            H (torch.Tensor): Hidden variables.
+            beta (float, optional): Inverse temperature. Defaults to 1..
+
         Returns:
-            list: (visible variables, visible magnetizations, hidden variables, hidden magnetizations)
+            list: (label varaibles, label magnetizations)
+        """
+
+        z = self.lbias + torch.tensordot(self.D, H, dims=[[1], [1]]).t() # (Ns, num_categ)
+        ml = torch.softmax(beta * z, 1) # (Ns, num_categ)
+        l = Categorical(logits=(beta * z)).sample() # (Ns,)
+
+        return l, ml 
+    
+    def sampleLabelsData(self, V : torch.Tensor, beta=1.) -> torch.Tensor:
+        """Monte Carlo sampling of labels starting from data.
+
+        Args:
+            V (torch.Tensor): Visible variables.
+            beta (float, optional): Inverse temperature. Defaults to 1..
+
+        Returns:
+            torch.Tensor: Sampled labels.
+        """
+
+        l = torch.randint(0, self.num_categ, (self.mb_s,))
+        visible_field = torch.tensordot(V, self.W, dims=[[1], [0]])
+
+        for _ in range(self.gibbs_steps):
+            # sample from p(h|l; v_data)
+            I = visible_field + self.D[l, :] # (Ns, Nh)
+            mh = torch.sigmoid(beta * (self.hbias + I))
+            h = torch.bernoulli(mh)
+            # sample from p(l|h)
+            z = self.lbias + torch.tensordot(self.D, h, dims=[[1], [1]]).t() # (Ns, num_categ)
+            l = Categorical(logits=(beta * z)).sample()
+
+        return l
+    
+    def getAv_PCD(self) -> list:
+        """Performs it_mcmc Gibbs steps starting from the permanent chains. Used for the training in PCD and CD mode.
+
+        Returns:
+            list: (visible variables, visible magnetizations, hidden variables, hidden magnetizations, label variables, label magnetizations)
         """
 
         v = self.X_pc
-        h, _ = self.sampleHiddens(v)
-        v, _ = self.sampleVisibles(h)
+        l = self.l_pc
+        _, mh = self.sampleHiddens(v, l)
+        v, _ = self.sampleVisibles(mh)
+        l, _ = self.sampleLabels(mh)
 
         for _ in range(1, self.gibbs_steps):
-            h, _ = self.sampleHiddens(v)
-            v, _ = self.sampleVisibles(h)
+            _, mh = self.sampleHiddens(v, l)
+            v, _ = self.sampleVisibles(mh)
+            l, _ = self.sampleLabels(mh)
         
-        return v, h
+        return v, mh, l
+    
+    def getAv_fixedLabel(self, L : torch.Tensor) -> list:
+        """Performs it_mcmc Gibbs steps conditioned to the labels. Used for the training in Rdm mode.
 
-    def sampling(self, X : torch.Tensor, it_mcmc : int=None, batch_size : int=-1) -> list:
-        """Samples variables and magnetizatons starting from the initial condition X.
+        Args:
+            L (torch.Tensor): Fixed labels.
+
+        Returns:
+            list: (visible variables, visible magnetizations, hidden variables, hidden magnetizations, label variables, label magnetizations)
+        """
+
+        v = self.X_pc
+        _, mh = self.sampleHiddens(v, L)
+        v, _ = self.sampleVisibles(mh)
+
+        for _ in range(1, self.gibbs_steps):
+            _, mh = self.sampleHiddens(v, L)
+            v, _ = self.sampleVisibles(mh)
+        
+        return v, mh
+    
+    def getAv_fixedVisible(self, V) -> list:
+        """Performs it_mcmc Gibbs steps conditioned to the visibles. Used for the training in Rdm mode.
+
+        Args:
+            V (torch.Tensor): Fixed visible variables.
+
+        Returns:
+            list: (visible variables, visible magnetizations, hidden variables, hidden magnetizations, label variables, label magnetizations)
+        """
+
+        l = self.l_pc
+        _, mh = self.sampleHiddens(V, l)
+        l, _ = self.sampleLabels(mh)
+
+        for _ in range(1, self.gibbs_steps):
+            _, mh = self.sampleHiddens(V, l)
+            l, _ = self.sampleLabels(mh)
+        
+        return mh, l
+
+    def conditioned_sampling(self, X : torch.Tensor, targets : torch.Tensor, it_mcmc : int=None, batch_size : int=-1) -> list:
+        """Samples variables and magnetizatons starting from the initial condition X
 
         Args:
             X (torch.Tensor): Initial condition, visible variables.
+            targets (torch.Tensor): Target labels.
             it_mcmc (int, optional): Number of Gibbs steps to perform. If not specified it is set to 'self.gibbs_steps'. Defaults to None.
             batch_size (int, optional): Batch size. Defaults to -1.
-            
+
         Returns:
             list: (visible variables, visible magnetizations, hidden variables, hidden magnetizations)
         """
@@ -287,104 +389,148 @@ class RBM:
         
         v = X.clone()
         n_data = X.shape[0]
-        h = torch.zeros(size=(n_data, self.Nh), device=self.device, dtype=self.dtype)
-        mh = torch.zeros(size=(n_data, self.Nh), device=self.device, dtype=self.dtype)
-        mv = torch.zeros(size=(n_data, self.Nv), device=self.device, dtype=self.dtype)
+        h = torch.zeros(size=(n_data, self.Nh), device=self.device)
+        mh = torch.zeros(size=(n_data, self.Nh), device=self.device)
+        mv = torch.zeros(size=(n_data, self.Nv), device=self.device)
         
         if batch_size == -1:
             for _ in range(it_mcmc):
-                h, mh = self.sampleHiddens(v)
-                v, mv = self.sampleVisibles(h)
-                
+                h, mh = self.sampleHiddens(v, targets)
+                v, mv = self.sampleVisibles(mh)
+        
         else:
             num_batches = n_data // batch_size
             for m in range(num_batches):
+                targets_batch = targets[m * batch_size : (m + 1) * batch_size]
                 v_batch = v[m * batch_size : (m + 1) * batch_size]
                 for _ in range(it_mcmc):
-                    h_batch, mh_batch = self.sampleHiddens(v_batch)
-                    v_batch, mv_batch = self.sampleVisibles(h_batch)
+                    h_batch, mh_batch = self.sampleHiddens(v_batch, targets_batch)
+                    v_batch, mv_batch = self.sampleVisibles(mh_batch)
                 v[m * batch_size : (m + 1) * batch_size] = v_batch
                 h[m * batch_size : (m + 1) * batch_size] = h_batch
                 mv[m * batch_size : (m + 1) * batch_size] = mv_batch
                 mh[m * batch_size : (m + 1) * batch_size] = mh_batch
             # handle the remaining data
             if n_data % batch_size != 0:
+                targets_batch = targets[num_batches * batch_size:]
                 v_batch = v[num_batches * batch_size:]
                 for _ in range(it_mcmc):
-                    h_batch, mh_batch = self.sampleHiddens(v_batch)
-                    v_batch, mv_batch = self.sampleVisibles(h_batch)
+                    h_batch, mh_batch = self.sampleHiddens(v_batch, targets_batch)
+                    v_batch, mv_batch = self.sampleVisibles(mh_batch)
                 v[num_batches * batch_size:] = v_batch
                 h[num_batches * batch_size:] = h_batch
                 mv[num_batches * batch_size:] = mv_batch
                 mh[num_batches * batch_size:] = mh_batch
-                
+
         return v, mv, h, mh
     
-    def track_mc(self, X : torch.Tensor, it_mcmc=None, record_window=10, beta=1.) -> list:
-        """Returns points every 'record_window' steps from the chain of lenght 'it_mcmc' starting from the initial condition X.
+    def predict(self, X : torch.Tensor, L_init : torch.Tensor, it_mcmc : int=10, batch_size : int=-1) -> torch.Tensor:
+        """Returns the label magnetization predicted for the input X.
 
         Args:
-            X (torch.Tensor): Initial conditions, visible variables.
-            it_mcmc (int, optional): Number of Gibbs steps to perform. If not specified it is set to 'self.gibbs_steps'. Defaults to None.
-            record_window (int, optional): Number of steps between two consecutive records. Defaults to 10.
-            beta (float, optional): Inverse temperature. Defaults to 1..
-
+            X (torch.Tensor): Visible units input.
+            L_init (torch.Tensor): Labels initialization.
+            it_mcmc (int, optional): Number of iterations of the Markov Chain. Defaults to 10.
+            batch_size (int, optional): Batch size. Defaults to -1.
+            
         Returns:
-            list: Trajectories of (visible variables, hidden variables)
+            torch.Tensor: Label magnetizations.
         """
 
-        if not it_mcmc:
-            it_mcmc = self.gibbs_steps
-
-        history_v = []
-        history_h = []
+        l = L_init.clone()
+        ml = torch.zeros(size=(X.shape[0], self.num_categ), device=self.device)
+        n_data = X.shape[0]
         
-        v = X
-        history_v.append(v.unsqueeze(0))
+        if batch_size == -1:
+            for _ in range(it_mcmc):
+                h, _ = self.sampleHiddens(X, l)
+                l, ml = self.sampleLabels(h)
+        else:
+            num_batches = n_data // batch_size
+            for m in range(num_batches):
+                l_batch = l[m * batch_size : (m + 1) * batch_size]
+                X_batch = X[m * batch_size : (m + 1) * batch_size]
+                for _ in range(it_mcmc):
+                    h_batch, _ = self.sampleHiddens(X_batch, l_batch)
+                    l_batch, ml_batch = self.sampleLabels(h_batch)
+                ml[m * batch_size : (m + 1) * batch_size] = ml_batch
+            # handle the remaining data
+            if n_data % batch_size != 0:
+                l_batch = l[num_batches * batch_size:]
+                X_batch = X[num_batches * batch_size:]
+                for _ in range(it_mcmc):
+                    h_batch, _ = self.sampleHiddens(X_batch, l_batch)
+                    l_batch, ml_batch = self.sampleLabels(h_batch)
+                ml[num_batches * batch_size:] = ml_batch
+                    
+        return ml
+    
+    def computeDeltaLabel(self, L : torch.Tensor) -> torch.Tensor:
+        """Used for computing the gradient of the Likelihood wrt the label fields.
+
+        Args:
+            L (torch.Tensor): Labels.
+
+        Returns:
+            torch.Tensor: Frequencies of the label categories at each site.
+        """
+
+        delta = (L == self.all_categ).type(self.dtype).mean(1)
+        delta = torch.clamp(delta, min=self.eps, max=1. - self.eps) # (num_categ, Nv)
         
-        pbar = tqdm(total=it_mcmc, colour='red')
-        pbar.set_description('MCMC steps')
+        return delta
+    
+    def computeDeltaLabelH(self, L : torch.Tensor, H : torch.Tensor) -> torch.Tensor:
+        """Used for computing the gradient of the Likelihood wrt the weights of the interaction hiddens-labels.
 
-        h, _, = self.sampleHiddens(v, beta=beta)
-        v, _ = self.sampleVisibles(h, beta=beta)
-        pbar.update(1)
-        history_h.append(h.unsqueeze(0))
+        Args:
+            L (torch.Tensor): Labels.
+            H (torch.Tensor): Hidden units.
 
-        for t in range(it_mcmc - 1):
-            
-            h, _ = self.sampleHiddens(v, beta=beta)
-            v, _ = self.sampleVisibles(h, beta=beta)
+        Returns:
+            torch.Tensor: Average tensor product between labels and hidden variables.
+        """
 
-            if t % record_window == 0:
-                history_v.append(v.unsqueeze(0))
-                history_h.append(h.unsqueeze(0))
+        Ns = L.shape[0]
+        delta = (L == self.all_categ).type(self.dtype) # (num_categ, Ns)
+        delta = torch.clamp(delta, min=self.eps, max=1. - self.eps)
 
-        return torch.cat(history_v, 0), torch.cat(history_h, 0)
-   
-    def updateWeights(self, v_pos : torch.Tensor, h_pos : torch.Tensor,
-                        v_neg : torch.Tensor, h_neg : torch.Tensor) -> None:
+        return torch.tensordot(delta, H, dims=([1],[0])) / Ns # (num_categ, Nh)
+    
+    def updateWeights(self, v_pos : torch.Tensor, l_pos : torch.Tensor, h_pos : torch.Tensor,
+                        v_neg : torch.Tensor, l_neg : torch.Tensor, h_neg : torch.Tensor) -> None:
         """Computes the gradient of the Likelihood and updates the parameters.
 
         Args:
             v_pos (torch.Tensor): Visible variables (data).
+            l_pos (torch.Tensor): Label variables (data).
             h_pos (torch.Tensor): Hidden variables after one Gibbs-step from the data.
             v_neg (torch.Tensor): Visible variables sampled after 'self.gibbs_steps' Gibbs-steps.
+            l_neg (torch.Tensor): Label variables sampled after 'self.gibbs_steps' Gibbs-steps.
             h_neg (torch.Tensor): Hidden variables sampled after 'self.gibbs_steps' Gibbs-steps.
         """
+        
         Ns = v_pos.shape[0]
-        dW = torch.tensordot(v_pos, h_pos, dims=([0],[0])) / Ns - torch.tensordot(v_neg, h_neg, dims=([0],[0])) / v_neg.shape[0]
+        dW = torch.tensordot(v_pos, h_pos, dims=([0],[0])) / Ns - torch.tensordot(v_neg, h_neg, dims=([0],[0])) / v_neg.shape[0] - self.L2_reg * self.W - self.L1_reg * torch.sign(self.W)
+        dD = self.computeDeltaLabelH(l_pos, h_pos) - self.computeDeltaLabelH(l_neg, h_neg) - self.L2_reg * self.D - self.L1_reg * torch.sign(self.D)
+            
         self.W += self.lr * dW
+        self.D += self.lr_labels * dD
+        self.D -= self.D.mean(0) # gauge fixing
         self.vbias += self.lr * (v_pos.mean(0) - v_neg.mean(0))
         self.hbias += self.lr * (h_pos.mean(0) - h_neg.mean(0))
+        self.lbias += self.lr_labels * (self.computeDeltaLabel(l_pos) - self.computeDeltaLabel(l_neg))
         
-    def updateWeightsCentered(self, v_pos : torch.Tensor, h_pos : torch.Tensor,
-                        v_neg : torch.Tensor, h_neg : torch.Tensor) -> None:
+    def updateWeightsCentered(self, v_pos : torch.Tensor, l_pos : torch.Tensor, h_pos : torch.Tensor,
+                        v_neg : torch.Tensor, l_neg : torch.Tensor, h_neg : torch.Tensor) -> None:
         """Computes the centered gradient of the Likelihood and updates the parameters.
 
         Args:
             v_pos (torch.Tensor): Visible variables (data).
+            l_pos (torch.Tensor): Label variables (data).
             h_pos (torch.Tensor): Hidden variables after one Gibbs-step from the data.
             v_neg (torch.Tensor): Visible variables sampled after 'self.gibbs_steps' Gibbs-steps.
+            l_neg (torch.Tensor): Label variables sampled after 'self.gibbs_steps' Gibbs-steps.
             h_neg (torch.Tensor): Hidden variables sampled after 'self.gibbs_steps' Gibbs-steps.
         """
 
@@ -393,25 +539,33 @@ class RBM:
         # averages over data and generated samples
         self.visDataAv = v_pos.mean(0)
         self.hidDataAv = h_pos.mean(0)
+        self.labDataAv = self.computeDeltaLabel(l_pos)
         visGenAv = v_neg.mean(0)
         hidGenAv = h_neg.mean(0)
+        labGenAv = self.computeDeltaLabel(l_neg)
 
         # centered variables
         vis_c_pos = v_pos - self.visDataAv # (Ns, Nv)
         hid_c_pos = h_pos - self.hidDataAv # (Ns, Nh)
+        lab_c_pos = (l_pos == self.all_categ).type(self.dtype).transpose(0, 1) - self.labDataAv # (Ns, num_categ)
 
         vis_c_neg = v_neg - self.visDataAv # (Ns, Nv)
         hid_c_neg = h_neg - self.hidDataAv # (Ns, Nh)
-
+        lab_c_neg = (l_neg == self.all_categ).type(self.dtype).transpose(0, 1) - self.labDataAv # (Ns, num_categ)
         # gradients
-        dW = torch.tensordot(vis_c_pos, hid_c_pos, dims=[[0], [0]]) / Ns - torch.tensordot(vis_c_neg, hid_c_neg, dims=[[0], [0]]) / v_neg.shape[0]
-        dvbias = self.visDataAv - visGenAv - torch.tensordot(dW, self.hidDataAv, dims=[[1],[0]])
+        dW = torch.tensordot(vis_c_pos, hid_c_pos, dims=[[0], [0]]) / Ns - torch.tensordot(vis_c_neg, hid_c_neg, dims=[[0], [0]]) / v_neg.shape[0] - self.L2_reg * self.W - self.L1_reg * torch.sign(self.W)
+        dD = torch.tensordot(lab_c_pos, hid_c_pos, dims=[[0], [0]]) / Ns - torch.tensordot(lab_c_neg, hid_c_neg, dims=[[0], [0]]) / l_neg.shape[0] - self.L2_reg * self.D - self.L1_reg * torch.sign(self.D)
+        dvbias = self.visDataAv - visGenAv - torch.tensordot(dW, self.hidDataAv, dims=[[1], [0]])
         dhbias = self.hidDataAv - hidGenAv - torch.tensordot(dW, self.visDataAv, dims=[[0], [0]])
+        dlabbias = self.labDataAv - labGenAv - torch.tensordot(dD, self.hidDataAv, dims=[[1], [0]])
 
         # parameters update
         self.W += self.lr * dW
+        self.D += self.lr_labels * dD
+        self.D -= self.D.mean(0) # gauge fixing
         self.vbias += self.lr * dvbias
         self.hbias += self.lr * dhbias
+        self.lbias += self.lr_labels * dlabbias
 
     def iterate_mf1(self, X : torch.Tensor, alpha=1e-6, max_iter=2000, tree_mode=False, beta=1., rho=0.) -> list:
         """Iterates the mean field self-consistency equations at first order (naive mean field), starting from the visible units X, until convergence.
@@ -425,15 +579,18 @@ class RBM:
             rho (float, optional): Dumping parameter. Defaults to 0..
 
         Returns:
-            list: Fixed points of (visible magnetizations, hidden magnetizations)
+            list: Fixed points of (visible magnetizations, hidden magnetizations, label magnetizations)
         """
         
         if tree_mode:
             # In this case X is a tuple of magnetization batches
-            mv, mh = X
+            mv, mh, ml = X
         else:
             # In this case X is a visible units batch
-            _, mh = self.sampleHiddens(X)
+            L_init = torch.randint(0, self.num_categ, size=(X.shape[0],), device=self.device)
+            ml = self.predict(X, L_init, it_mcmc=self.gibbs_steps, verbose=False)
+            L = torch.argmax(ml, 1)
+            _, mh = self.sampleHiddens(X, L)
             _, mv = self.sampleVisibles(mh)
 
         iterations = 0
@@ -441,23 +598,28 @@ class RBM:
         while True:
             mv_prev = torch.clone(mv)
             mh_prev = torch.clone(mh)
+            ml_prev = torch.clone(ml)
 
-            field_h = self.hbias + beta * torch.tensordot(mv, self.W, dims=[[1], [0]])
+            field_h = self.hbias + beta * torch.tensordot(mv, self.W, dims=[[1], [0]]) + torch.tensordot(ml, self.D, dims=[[1], [0]])
             mh = rho * mh_prev + (1. - rho) * torch.sigmoid(field_h)
-
+            
             field_v = self.vbias + beta * torch.tensordot(mh, self.W, dims=[[1], [1]])
             mv = rho * mv_prev + (1. - rho) * torch.sigmoid(field_v)
+            
+            field_l = self.lbias + torch.tensordot(mh, self.D, dims=[[1], [1]])
+            ml = rho * ml_prev + (1. - rho) * torch.softmax(field_l, 1) # (Ns, n_categ)
 
             eps1 = torch.abs(mv - mv_prev).max()
             eps2 = torch.abs(mh - mh_prev).max()
+            eps3 = torch.abs(ml - ml_prev).max()
 
-            if max(eps1, eps2) < alpha:
+            if max([eps1, eps2, eps3]) < alpha:
                 break
             iterations += 1
             if iterations >= max_iter:
                 break
 
-        return mv, mh
+        return mv, mh, ml
 
     def iterate_mf2(self, X : torch.Tensor, alpha=1e-6, max_iter=2000, tree_mode=False, beta=1., rho=0.) -> list:
         """Iterates the mean-field self-consistency equations at second order (TAP equations), starting from the visible units X, until convergence.
@@ -471,107 +633,66 @@ class RBM:
             rho (float, optional): Dumping parameter. Defaults to 0..
 
         Returns:
-            list: Fixed points of (visible magnetizations, hidden magnetizations)
+            list: Fixed points of (visible magnetizations, hidden magnetizations, label magnetizations)
         """
 
         if tree_mode:
             # In this case X is the a vector of magnetization batches
-            mv, mh = X
+            mv, mh, ml = X
         else:
             # In this case X is a visible units batch
-            _, mh = self.sampleHiddens(X)
+            L_init = torch.randint(0, self.num_categ, size=(X.shape[0],), device=self.device)
+            ml = self.predict(X, L_init, it_mcmc=self.gibbs_steps)
+            L = torch.argmax(ml, 1)
+            _, mh = self.sampleHiddens(X, L)
             _, mv = self.sampleVisibles(mh)
         
         W2 = torch.square(self.W)
+        D2 = torch.square(self.D)
         iterations = 0
-    
+
         while True:
             mv_prev = torch.clone(mv)
             mh_prev = torch.clone(mh)
+            ml_prev = torch.clone(ml)
             
             dmv = mv - torch.square(mv)
+            W2 = torch.pow(self.W, 2)
+            cD = torch.tensordot(ml, self.D, dims=[[1], [0]]) # (Ns, Nh)
             
             field_h = self.hbias \
-                + beta * torch.tensordot(mv, self.W, dims=[[1], [0]]) \
-                + beta**2 * (0.5 - mh) * torch.tensordot(dmv, W2, dims=[[1], [0]])
+                + beta * (torch.tensordot(mv, self.W, dims=[[1], [0]]) + torch.tensordot(ml, self.D, dims=[[1], [0]])) \
+                + beta**2 * (0.5 - mh) * (
+                    torch.tensordot(dmv, W2, dims=[[1], [0]]) \
+                    + torch.tensordot(ml, D2, dims=[[1], [0]]) \
+                    - torch.square(cD))
             mh = rho * mh_prev + (1. - rho) * torch.sigmoid(field_h)
             
             dmh = mh - torch.square(mh)
+            mcD = torch.multiply(cD, dmh) # (Ns, Nh)
             field_v = self.vbias \
                 + beta * torch.tensordot(mh, self.W, dims=[[1], [1]]) \
                 + beta**2 * (0.5 - mv) * torch.tensordot(dmh, W2, dims=[[1], [1]])
             mv = rho * mv_prev + (1. - rho) * torch.sigmoid(field_v)
+            
+            field_l = self.lbias \
+                + beta * torch.tensordot(mh, self.D, dims=[[1], [1]]) \
+                + beta**2 * (0.5 * torch.tensordot(dmh, D2, dims=[[1], [1]]) \
+                - torch.tensordot(mcD, self.D, dims=[[1], [1]]))
+            ml = rho * ml_prev + (1. - rho) * torch.softmax(field_l, 1) # (Ns, n_categ)
 
             eps1 = torch.abs(mv - mv_prev).max()
             eps2 = torch.abs(mh - mh_prev).max()
-
-            if max(eps1, eps2) < alpha:
+            eps3 = torch.abs(ml - ml_prev).max()
+            
+            if max([eps1, eps2, eps3]) < alpha:
                 break
                 
             iterations += 1
             if iterations >= max_iter:
                 break
 
-        return mv, mh
-    
-    def iterate_mf3(self, X : torch.Tensor, alpha=1e-6, max_iter=2000, tree_mode=False, beta=1., rho=0.) -> list:
-        """Iterates the mean field self-consistency equations at third order, starting from the visible units X, until convergence.
-
-        Args:
-            X (torch.Tensor): Initial condition (visible variables).
-            eps (float, optional): Convergence threshold. Defaults to 1e-6.
-            max_iter (int, optional): Maximum number of iterations. Defaults to 2000.
-            tree_mode (bool, optional): Option for the tree construction algorithm. Defaults to False.
-            beta (float, optional): Inverse temperature. Defaults to 1..
-            rho (float, optional): Dumping parameter. Defaults to 0..
-
-        Returns:
-            list: Fixed points of (visible magnetizations, hidden magnetizations)
-        """
-
-        if tree_mode:
-            # In this case X is the a vector of magnetization batches
-            mv, mh = X
-        else:
-            # In this case X is a visible units batch
-            _, mh = self.sampleHiddens(X)
-            _, mv = self.sampleVisibles(mh)
-        
-        iterations = 0
-        W2 = torch.pow(self.W, 2)
-        W3 = torch.pow(self.W, 3)
-
-        while True:
-            mv_prev = torch.clone(mv)
-            mh_prev = torch.clone(mh)
-            
-            dmv = mv - torch.square(mv)
-            dmh = mh - torch.square(mh)
-            
-            field_h = self.hbias \
-                + beta * torch.tensordot(mv, self.W, dims=[[1], [0]]) \
-                + beta**2 * (0.5 - mh) * torch.tensordot(dmv, W2, dims=[[1], [0]]) \
-                + beta**3 * (1/3 - 2 * dmh) * torch.tensordot(dmv * (0.5 - mv), W3, dims=[[1], [0]])
-            mh = rho * mh_prev + (1. - rho) * torch.sigmoid(field_h)
-            
-            dmh = mh - torch.square(mh)
-            field_v = self.vbias \
-                + beta * torch.tensordot(mh, self.W, dims=[[1], [1]]) \
-                + beta**2 * (0.5 - mv) * torch.tensordot(dmh, W2, dims=[[1], [1]]) \
-                + beta**3 * (1/3 - 2 * dmv) * torch.tensordot(dmh * (0.5 - mh), W3, dims=[[1], [1]])
-            mv = rho * mv_prev + (1. - rho) * torch.sigmoid(field_v)
-
-            eps1 = torch.abs(mv - mv_prev).max()
-            eps2 = torch.abs(mh - mh_prev).max()
-
-            if max(eps1, eps2) < alpha:
-                break
-                
-            iterations += 1
-            if iterations >= max_iter:
-                break
-
-        return mv, mh
+        return mv, mh, ml
     
     def iterate_mean_field(self, X : torch.Tensor, order=2, batch_size=128, alpha=1e-6, tree_mode=False, verbose=True, beta=1., rho=0., max_iter=2000) -> list:
         """Iterates the mean field self-consistency equations at the specified order, starting from the visible units X, until convergence.
@@ -591,18 +712,16 @@ class RBM:
             NotImplementedError: If the specifiend order of expansion has not been implemented.
 
         Returns:
-            list: Fixed points of (visible magnetizations, hidden magnetizations)
+            list: Fixed points of (visible magnetizations, hidden magnetizations, label magnetizations)
         """
 
-        if order not in [1, 2, 3]:
+        if order not in [1, 2]:
             raise NotImplementedError('Possible choices for the order parameter: (1, 2)')
 
         if order == 1:
             sampling_function = self.iterate_mf1
         elif order == 2:
             sampling_function = self.iterate_mf2
-        elif order == 3:
-            sampling_function = self.iterate_mf3
 
         if tree_mode:
             n_data = X[0].shape[0]
@@ -611,11 +730,10 @@ class RBM:
 
         mv = torch.tensor([], device=self.device)
         mh = torch.tensor([], device=self.device)
+        ml = torch.tensor([], device=self.device)
 
         num_batches = n_data // batch_size
-        num_batches_tail = num_batches
         if n_data % batch_size != 0:
-            num_batches_tail += 1
             if verbose:
                 pbar = tqdm(total=num_batches + 1, colour='red', ascii='-#')
                 pbar.set_description('Iterating Mean Field')
@@ -631,9 +749,10 @@ class RBM:
             else:
                 X_batch = X[m * batch_size : (m + 1) * batch_size, :]
 
-            mv_batch, mh_batch = sampling_function(X_batch, alpha=alpha, tree_mode=tree_mode, beta=beta, rho=rho, max_iter=max_iter)
+            mv_batch, mh_batch, ml_batch = sampling_function(X_batch, alpha=alpha, tree_mode=tree_mode, beta=beta, rho=rho, max_iter=max_iter)
             mv = torch.cat([mv, mv_batch], 0)
             mh = torch.cat([mh, mh_batch], 0)
+            ml = torch.cat([ml, ml_batch], 0)
             
             if verbose:
                 pbar.update(1)
@@ -647,93 +766,84 @@ class RBM:
             else:
                 X_batch = X[num_batches * batch_size:, :]
                 
-            mv_batch, mh_batch = sampling_function(X_batch, alpha=alpha, tree_mode=tree_mode, beta=beta, rho=rho, max_iter=max_iter)
+            mv_batch, mh_batch, ml_batch = sampling_function(X_batch, alpha=alpha, tree_mode=tree_mode, beta=beta, rho=rho, max_iter=max_iter)
             mv = torch.cat([mv, mv_batch], 0)
             mh = torch.cat([mh, mh_batch], 0)
+            ml = torch.cat([ml, ml_batch], 0)
             
             if verbose:
                 pbar.update(1)
                 pbar.close()
 
-        return mv, mh
+        return mv, mh, ml
     
-    def TAP_trajectory(self, X, it_mcmc=100, rho=0., beta=1., alpha=1e-6):
-        mv_history = []
-        mh_history = []
-        #mv = X.type(torch.double)
-        pbar = tqdm(total=it_mcmc, colour='Green')
-        norm = self.W.sum().type(torch.double)
-        norm=1.
-        
-        _, mh = self.sampleHiddens(X)
-        _, mv = self.sampleVisibles(mh)
-        #mh = X[1]
-        #mv = X[0]
-        mv = mv.type(torch.double)
-        mh = mh.type(torch.double)
-        mv_history.append(mv.unsqueeze(0))
-        mh_history.append(mh.unsqueeze(0))
-        W2 = torch.square(self.W).type(torch.double) / norm
-        W=self.W.type(torch.double)/norm
-
-        iterations = 0
-
-        while True:
-            mv_prev = torch.clone(mv)
-            mh_prev = torch.clone(mh)
-            
-            dmv = mv - torch.square(mv)
-            
-            field_h = self.hbias.type(torch.double) / norm\
-                + beta * torch.tensordot(mv, W, dims=[[1], [0]]) \
-                + beta**2 * (0.5 - mh) * torch.tensordot(dmv, W2, dims=[[1], [0]])
-            mh = rho * mh_prev + (1. - rho) * torch.sigmoid(field_h)
-            
-            dmh = mh - torch.square(mh)
-            field_v = self.vbias.type(torch.double) / norm\
-                + beta * torch.tensordot(mh, W, dims=[[1], [1]]) \
-                + beta**2 * (0.5 - mv) * torch.tensordot(dmh, W2, dims=[[1], [1]])
-            mv = rho * mv_prev + (1. - rho) * torch.sigmoid(field_v)
-
-            eps1 = torch.abs(mv - mv_prev).max()
-            eps2 = torch.abs(mh - mh_prev).max()
-
-            if (eps1 < alpha) and (eps2 < alpha):
-                break
-            
-            mv_history.append(mv.unsqueeze(0))
-            mh_history.append(mh.unsqueeze(0))
-            
-            iterations += 1
-            if iterations >= it_mcmc:
-                break
-             
-            pbar.update(1)
-        return (torch.cat(mv_history, dim=0), torch.cat(mh_history, dim=0))
-    
-    def fitBatch(self, X : torch.Tensor) -> None:
-        """Updates the model's parameters using the data batch X.
+    def fitBatchRdm(self, X : torch.Tensor, L : torch.Tensor) -> None:
+        """Updates the model's parameters using the data batch (X, L).
 
         Args:
             X (torch.Tensor): Batch of data.
+            L (torch.Tensor): Batch of labels.
         """
+        
+        if self.partial_labels:
+            # identify data without labels
+            no_label = (L == -1)
+            # sample labels from data
+            L_gen = self.sampleLabelsData(X)
+            # substitute the missing labels with the sampled ones
+            L[no_label] = L_gen[no_label]
 
-        h_pos, _ = self.sampleHiddens(X)
+        h_pos, _ = self.sampleHiddens(X, L)
         if self.CDLearning:
             # in CD mode, the Markov Chain starts from the data in the batch
             self.X_pc = X
-            self.X_pc, h_neg = self.getAv()
+            self.l_pc = L
+            self.X_pc, h_neg, self.l_pc = self.getAv()
         else:
-            self.X_pc, h_neg = self.getAv()
+            # gradient with label fixed
+            self.X_pc, h_neg_fl = self.getAv_fixedLabel(L)
+            
+            # gradient with visible configuration fixed
+            h_neg_fv, self.l_pc = self.getAv_fixedVisible(X)
         
         if self.updCentered:
-            self.updateWeightsCentered(X, h_pos, self.X_pc, h_neg)
+            self.updateWeightsCentered(X, L, h_pos, self.X_pc, L, h_neg_fl)
+            self.updateWeightsCentered(X, L, h_pos, X, self.l_pc, h_neg_fv)
         else:   
-            self.updateWeights(X, h_pos, self.X_pc, h_neg)
+            self.updateWeights(X, L, h_pos, self.X_pc, L, h_neg_fl)
+            self.updateWeights(X, L, h_pos, X, self.l_pc, h_neg_fv)
     
-    def fit(self, train_dataset : torch.utils.data.Dataset, training_mode : str='PCD', epochs : int=1000, num_pcd=500, lr : float=0.01,
-            batch_size : int=500, gibbs_steps : int=10, updCentered : bool=True,
-            restore : bool=False) -> None:
+    def fitBatchPCD(self, X : torch.Tensor, L : torch.Tensor) -> None:
+        """Updates the model's parameters using the data batch (X, L).
+
+        Args:
+            X (torch.Tensor): Batch of data.
+            L (torch.Tensor): Batch of labels.
+        """
+        if self.partial_labels:
+            # identify data without labels
+            no_label = (L == -1)
+            # sample labels from data
+            L_gen = self.sampleLabelsData(X)
+            # substitute the missing labels with the sampled ones
+            L[no_label] = L_gen[no_label]
+
+        h_pos, _ = self.sampleHiddens(X, L)
+        if self.CDLearning:
+            # in CD mode, the Markov Chain starts from the data in the batch
+            self.X_pc = X
+            self.l_pc = L
+            self.X_pc, h_neg, self.l_pc = self.getAv_PCD()
+        else:
+            self.X_pc, h_neg, self.l_pc = self.getAv_PCD()
+        
+        if self.updCentered:
+            self.updateWeightsCentered(X, L, h_pos, self.X_pc, self.l_pc, h_neg)
+        else:   
+            self.updateWeights(X, L, h_pos, self.X_pc, self.l_pc, h_neg)
+    
+    def fit(self, train_dataset : torch.utils.data.Dataset, training_mode : str='PCD', epochs : int=1000, num_pcd=500, lr : float=0.01, lr_labels : float=0.01,
+            batch_size : int=500, gibbs_steps : int=10, L1_reg : float=0., L2_reg : float=0., updCentered : bool=True, restore : bool=False) -> None:
         """Train the model.
 
         Args:
@@ -741,24 +851,34 @@ class RBM:
             training_mode (str, optional): Training mode among (CD, PCD, Rdm). Defaults to 'PCD'.
             epochs (int, optional): Number of epochs for the training. Defaults to 1000.
             num_pcd (int, optional): Number of permanent chains. Defaults to 500.
-            lr (float, optional): Learning rate. Defaults to 0.001.
-            batch_size (int, optional): Batch size. Defaults to 500.
+            lr (float, optional): Learning rate. Defaults to 0.01.
+            lr_labels (float, optional): Learning rate of the labels matrix. Defaults to 0.01.
+            batch_size (int, optional): Batch size. Defaults to 256.
             gibbs_steps (int, optional): Number of MCMC steps for evaluating the gradient. Defaults to 10.
+            L1_reg (float, optional): L1 regularization parameter. Defaults to 0..
+            L2_reg (float, optional): L2 regularization parameter. Defaults to 0..
             updCentered (bool, optional): Option for centering the gradient. Defaults to True.
             restore (bool, optional): Option for restore the training of an old model. Defaults to False.
         """
         
-        # initialize training of a new RBM
+        # initialize trainig of a new RBM
         if not restore:
             self.training_mode = training_mode
+            self.num_categ = train_dataset.get_num_categs()
             self.ep_max = epochs
             self.lr = lr
+            self.lr_labels = lr_labels
             self.num_pcd = num_pcd
             self.mb_s = batch_size
             self.gibbs_steps = gibbs_steps
             self.updCentered = updCentered
-            self.UpdByEpoch = int(train_dataset.__len__() / self.mb_s) # number of batches
+            self.L1_reg = L1_reg
+            self.L2_reg = L2_reg
+            self.UpdByEpoch = int(train_dataset.__len__() / self.mb_s)
             self.visDataAv = train_dataset.get_dataset_mean()
+            # Track if there are missing labels in the dataset and how many
+            self.partial_labels = train_dataset.partial_labels
+            self.lab_frac = train_dataset.get_labels_frac()
             self.time_start = time.time()
             
             if training_mode == 'Rdm':
@@ -775,6 +895,7 @@ class RBM:
                 self.X_pc = torch.rand((self.num_pcd, self.Nv), device=self.device, dtype=self.dtype)
             else:
                 self.X_pc = torch.randint(0, 2, (self.num_pcd, self.Nv), device=self.device, dtype=self.dtype)
+            self.l_pc = torch.randint(0, self.num_categ, (self.num_pcd,), device=self.device, dtype=torch.int64)
             self.save_RBM_state()
             
         # create dataloader
@@ -790,13 +911,20 @@ class RBM:
                 
             for batch in train_dataloader:
                 if self.ResetPermChainBatch:
+                    print('')
                     if self.continuous_dataset:
                         self.X_pc = torch.rand((self.num_pcd, self.Nv), device=self.device, dtype=self.dtype)
                     else:
                         self.X_pc = torch.randint(0, 2, (self.num_pcd, self.Nv), device=self.device, dtype=self.dtype)
+                    self.l_pc = torch.randint(0, self.num_categ, (self.num_pcd,), device=self.device, dtype=torch.int64)
 
-                Xb = batch.to(self.device)
-                self.fitBatch(Xb)
+                Xb, Lb = batch
+                Xb = Xb.to(self.device)
+                Lb = Lb.to(self.device)
+                if self.training_mode == 'Rdm':
+                    self.fitBatchRdm(Xb, Lb)
+                else:
+                    self.fitBatchPCD(Xb, Lb)
                 self.up_tot += 1
 
             if self.ep_tot in self.list_save_rbm:
@@ -808,9 +936,13 @@ class RBM:
             fname_new = self.generate_model_stamp(dataset_stamp=self.dataset_filename.split('/')[-1][:-3],
                                                   epochs=self.ep_max,
                                                   learning_rate=self.lr,
+                                                  learning_rate_labels=self.lr_labels,
                                                   gibbs_steps=self.gibbs_steps,
                                                   batch_size=self.mb_s,
-                                                  n_chains=self.num_pcd,
+                                                  partial_labels=self.partial_labels,
+                                                  perc_labels=self.lab_frac,
+                                                  L1_reg=self.L1_reg,
+                                                  L2_reg=self.L2_reg,
                                                   training_mode=self.training_mode)
             self.file_stamp = fname_new
             os.rename(fname_old, fname_new)
@@ -824,11 +956,16 @@ class RBM:
         """
         
         if (len(self.list_save_rbm) > 0) & (self.ep_tot == 0):
-            f = h5py.File(self.file_stamp, 'w')   
+            f = h5py.File(self.file_stamp, 'w')
             f.create_dataset('lr', data=self.lr)
+            f.create_dataset('lr_labels', data=self.lr_labels)
+            f.create_dataset('partial_labels', data=self.partial_labels)
+            f.create_dataset('lab_frac', data=self.lab_frac)
             f.create_dataset('NGibbs', data=self.gibbs_steps)
             f.create_dataset('miniBatchSize', data=self.mb_s)
             f.create_dataset('numPCD', data=self.num_pcd)
+            f.create_dataset('L1_reg', data=self.L1_reg)
+            f.create_dataset('L2_reg', data=self.L2_reg)
             f.create_dataset('alltime', data=self.list_save_rbm)
             f.create_dataset('training_mode', data=self.training_mode)
             f.create_dataset('var_init', data=self.var_init)
@@ -845,10 +982,10 @@ class RBM:
 
             f['ep_tot'] = self.ep_tot
             f['up_tot'] = self.up_tot
-            f['X_pc'] = self.X_pc.cpu()
             if self.updCentered:
                 f['visDataAv'] = self.visDataAv.cpu()
                 f['hidDataAv'] = self.hidDataAv.cpu()
+                f['labDataAv'] = self.labDataAv.cpu()
             f['torch_rng_state'] = torch.get_rng_state()
             f['numpy_rng_arg0'] = np.random.get_state()[0]
             f['numpy_rng_arg1'] = np.random.get_state()[1]
@@ -860,12 +997,13 @@ class RBM:
         else:
             f = h5py.File(self.file_stamp, 'r+')
             f.create_dataset('W' + str(self.ep_tot), data=self.W.cpu())
+            f.create_dataset('D' + str(self.ep_tot), data=self.D.cpu())
             f.create_dataset('vbias' + str(self.ep_tot), data=self.vbias.cpu())
             f.create_dataset('hbias' + str(self.ep_tot), data=self.hbias.cpu())
+            f.create_dataset('lbias' + str(self.ep_tot), data=self.lbias.cpu())
             if self.training_mode == 'PCD':
-                del f['X_pc']
-                f['X_pc'] = self.X_pc.cpu()
-                
+                f.create_dataset('X_pc' + str(self.ep_tot), data=self.X_pc.cpu())
+                f.create_dataset('L_pc' + str(self.ep_tot), data=self.l_pc.cpu())
 
             del f['ep_tot']
             del f['ep_max']
@@ -874,6 +1012,7 @@ class RBM:
             if self.updCentered:
                 del f['visDataAv']
                 del f['hidDataAv']
+                del f['labDataAv']
             del f['alltime']
             del f['torch_rng_state']
             del f['numpy_rng_arg0']
@@ -887,6 +1026,7 @@ class RBM:
             if self.updCentered:
                 f['visDataAv'] = self.visDataAv.cpu()
                 f['hidDataAv'] = self.hidDataAv.cpu()
+                f['labDataAv'] = self.labDataAv.cpu()
             f['training_time'] = time.time() - self.time_start
             self.training_time = time.time() - self.time_start
             f['alltime'] = self.list_save_rbm[self.list_save_rbm <= self.ep_tot]
@@ -899,17 +1039,23 @@ class RBM:
             f.close()
             
     def generate_model_stamp(self, dataset_stamp : str, epochs : int, learning_rate : float,
-                             gibbs_steps : int, batch_size : int, n_chains : int, training_mode : str) -> str:
+                             learning_rate_labels : float, gibbs_steps : int, batch_size : int,
+                             partial_labels : bool, perc_labels : float, training_mode : str,
+                             L1_reg : str, L2_reg : str) -> str:
         """Produces the stamp that identifies the model.
 
         Args:
             dataset_stamp (str): Name of the dataset.
             epochs (int): Epochs of the training.
             learning_rate (float): Learning rate.
+            learning_rate_labels (float): Learning rate of the labels matrix.
             gibbs_steps (int): Number of MCMC steps for evaluating the gradient.
             batch_size (int): Batch size.
-            n_chains (int): Number of Markov chains.
+            partial_labels (bool): Wheather in the original dataset there were missing labels or not.
+            perc_labels (float): Ratio of the labels present.
             training_mode (str): Training mode among (PCD, CD, Rdm).
+            L1_reg (str): L1 regularization parameter.
+            L2_reg (str): L2 regularization parameter.
 
         Returns:
             str: Model identification stamp.
@@ -919,17 +1065,14 @@ class RBM:
             lr_description = 'Adaptive'
         else:
             lr_description = learning_rate
-        stamp = 'models/{0}/{1}-{2}-ep{3}-lr{4}-Nh{5}-NGibbs{6}-mbs{7}-chains{8}-{9}.h5'.format(
-            dataset_stamp,
-            self.model_stamp,
-            dataset_stamp,
-            epochs,
-            lr_description,
-            self.Nh,
-            gibbs_steps,
-            batch_size,
-            n_chains,
-            training_mode)
+        if partial_labels:
+            stamp = 'models/{0}/{1}-{2}-ep{3}-lr{4}-Nh{5}-NGibbs{6}-mbs{7}-partialLabels{8}-percLabels{9}-lr_labels{10}-L1{11}-L2{12}-{13}.h5'.format(
+                dataset_stamp, self.model_stamp, dataset_stamp, epochs, lr_description, self.Nh, gibbs_steps,
+                batch_size, partial_labels, perc_labels, learning_rate_labels, L1_reg, L2_reg, training_mode)
+        else:
+            stamp = 'models/{0}/{1}-{2}-ep{3}-lr{4}-Nh{5}-NGibbs{6}-mbs{7}-partialLabels{8}-lr_labels{9}-L1{10}-L2{11}-{12}.h5'.format(
+                dataset_stamp, self.model_stamp, dataset_stamp, epochs, lr_description, self.Nh, gibbs_steps,
+                batch_size, partial_labels, learning_rate_labels, L1_reg, L2_reg, training_mode)
         
         return stamp
     
@@ -943,7 +1086,7 @@ class RBM:
         model: {self.model_stamp.split('-')[0]}
         dataset: {self.dataset_filename.split('/')[-1]}
         training mode: {self.training_mode}
-        Nv: {self.Nv}  Nh: {self.Nh} epochs: {self.ep_tot} lr: {self.lr} gibbs_steps: {self.gibbs_steps} batch_size: {self.mb_s} num_pcd: {self.num_pcd}
+        Nv: {self.Nv}  Nh: {self.Nh} epochs: {self.ep_tot} lr: {self.lr} lr_labels: {self.lr_labels} gibbs_steps: {self.gibbs_steps} batch_size: {self.mb_s} num_pcd: {self.num_pcd} L1_reg: {self.L1_reg} L2_reg: {self.L2_reg}
         Gradient updates per epoch: {self.UpdByEpoch}
         training time: {training_h}h{training_m}m{training_s}s
         seed: {self.seed}
