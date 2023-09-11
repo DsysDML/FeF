@@ -18,7 +18,7 @@ export RBMHOME=/installation_path/RBM-Proteins
 
 ## Example data
 To download an example of an input file for training the RBM using the MNIST dataset, use
-```
+```bash
 wget --no-check-certificate 'https://drive.google.com/uc?export=download&id=1XiP_KPKuGZmxoqQz6tnVqUFlxf44S5kX' -O 'data/MNIST.h5'
 ```
 
