@@ -1,4 +1,6 @@
 # F&F - Fast and Functional Structured Data Generators
+[![arXiv](https://img.shields.io/badge/arXiv-2302.01851-blue.svg)](https://arxiv.org/abs/2307.06797)
+
 Code for the paper "Fast and Functional Structured Data Generators Rooted in Out-of-Equilibrium Physics" by Alessandra Carbone, Aurélien Decelle, Lorenzo Rosset and Beatriz Seoane.
 
 ## Installation
