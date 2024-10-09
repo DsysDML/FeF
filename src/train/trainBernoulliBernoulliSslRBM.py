@@ -120,6 +120,7 @@ parser.add_argument('--n_chains',           type=int,   default=500,        help
 parser.add_argument('--spacing',            type=str,   default='exp',      help='(Defaults to exp). Spacing to save models.', choices=['exp', 'linear'])
 parser.add_argument('--no_center_gradient',             default=True,       help='Use this option if you don\'t want the centered gradient.', action='store_false')
 parser.add_argument('--seed',               type=int,   default=0,          help='(Defaults to 0). Random seed.')
+parser.add_argument("single_grad", default=False, help="Use this option if you want to compute only one gradient with fixed labels.", action='store_true')
 args = parser.parse_args()
 
 dtype = torch.float32
@@ -197,7 +198,8 @@ if args.train_mode == 'new':
               gibbs_steps=args.n_gibbs,
               updCentered=args.no_center_gradient,
               L1_reg=args.l1_penalty,
-              L2_reg=args.l2_penalty
+              L2_reg=args.l2_penalty,
+              single_grad=args.single_grad,
              )
 
     print('\nTraining time: {:.1f} minutes'.format(rbm.training_time / 60))

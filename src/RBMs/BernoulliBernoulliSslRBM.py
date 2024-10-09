@@ -777,12 +777,13 @@ class RBM:
 
         return mv, mh, ml
     
-    def fitBatchRdm(self, X : torch.Tensor, L : torch.Tensor) -> None:
+    def fitBatchRdm(self, X : torch.Tensor, L : torch.Tensor, single_grad : bool=False) -> None:
         """Updates the model's parameters using the data batch (X, L).
 
         Args:
             X (torch.Tensor): Batch of data.
             L (torch.Tensor): Batch of labels.
+            single_grad (bool, optonal): Option for computing just one gradient with labels fixed. Defaults to False.
         """
         
         if self.partial_labels:
@@ -807,11 +808,17 @@ class RBM:
             h_neg_fv, self.l_pc = self.getAv_fixedVisible(X)
         
         if self.updCentered:
-            self.updateWeightsCentered(X, L, h_pos, self.X_pc, L, h_neg_fl)
-            self.updateWeightsCentered(X, L, h_pos, X, self.l_pc, h_neg_fv)
-        else:   
-            self.updateWeights(X, L, h_pos, self.X_pc, L, h_neg_fl)
-            self.updateWeights(X, L, h_pos, X, self.l_pc, h_neg_fv)
+            if single_grad:
+                self.updateWeightsCentered(X, L, h_pos, self.X_pc, L, h_neg_fl)
+            else:
+                self.updateWeightsCentered(X, L, h_pos, self.X_pc, L, h_neg_fl)
+                self.updateWeightsCentered(X, L, h_pos, X, self.l_pc, h_neg_fv)
+        else:
+            if single_grad:
+                self.updateWeights(X, L, h_pos, self.X_pc, L, h_neg_fl)
+            else:
+                self.updateWeights(X, L, h_pos, self.X_pc, L, h_neg_fl)
+                self.updateWeights(X, L, h_pos, X, self.l_pc, h_neg_fv)
     
     def fitBatchPCD(self, X : torch.Tensor, L : torch.Tensor) -> None:
         """Updates the model's parameters using the data batch (X, L).
@@ -843,7 +850,8 @@ class RBM:
             self.updateWeights(X, L, h_pos, self.X_pc, self.l_pc, h_neg)
     
     def fit(self, train_dataset : torch.utils.data.Dataset, training_mode : str='PCD', epochs : int=1000, num_pcd=500, lr : float=0.01, lr_labels : float=0.01,
-            batch_size : int=500, gibbs_steps : int=10, L1_reg : float=0., L2_reg : float=0., updCentered : bool=True, restore : bool=False) -> None:
+            batch_size : int=500, gibbs_steps : int=10, L1_reg : float=0., L2_reg : float=0., updCentered : bool=True, restore : bool=False,
+            single_grad: bool=False) -> None:
         """Train the model.
 
         Args:
@@ -922,7 +930,7 @@ class RBM:
                 Xb = Xb.to(self.device)
                 Lb = Lb.to(self.device)
                 if self.training_mode == 'Rdm':
-                    self.fitBatchRdm(Xb, Lb)
+                    self.fitBatchRdm(Xb, Lb, single_grad=single_grad)
                 else:
                     self.fitBatchPCD(Xb, Lb)
                 self.up_tot += 1
