@@ -19,10 +19,10 @@ from pathlib import Path
 # dataset class for this RBM
 
 class RBMdataset(Dataset):
-    def __init__(self, file_path, dataset='train', partial_labels=True, lab_frac=0.5, dtype=torch.float32):
+    def __init__(self, file_path, dataset='train', partial_labels=True, lab_frac=0.5, dtype=torch.float32, device=torch.device('cpu')):
         f = File(file_path, 'r')
         self.file_path = file_path
-        self.data = torch.tensor(f[dataset][()]).type(dtype)
+        self.data = torch.tensor(f[dataset][()]).type(dtype).to(device)
         self.partial_labels = partial_labels
         self.lab_frac = lab_frac
         labels_string = f[dataset + '_labels'].asstr()[()].flatten()
@@ -40,6 +40,7 @@ class RBMdataset(Dataset):
             missing_labels[label_idx] = all_labels[label_idx]
             self.labels = missing_labels
         f.close()
+        self.labels = self.labels.to(device)
 
     def __len__(self):
         return len(self.data)
@@ -120,7 +121,8 @@ parser.add_argument('--n_chains',           type=int,   default=500,        help
 parser.add_argument('--spacing',            type=str,   default='exp',      help='(Defaults to exp). Spacing to save models.', choices=['exp', 'linear'])
 parser.add_argument('--no_center_gradient',             default=True,       help='Use this option if you don\'t want the centered gradient.', action='store_false')
 parser.add_argument('--seed',               type=int,   default=0,          help='(Defaults to 0). Random seed.')
-parser.add_argument("single_grad", default=False, help="Use this option if you want to compute only one gradient with fixed labels.", action='store_true')
+parser.add_argument('--single_grad',                    default=False,      help="Use this option if you want to compute only one gradient with fixed labels.", action='store_true')
+parser.add_argument('--device_dataset',             type=str,   default='cpu',      help='(Defaults to cpu). Device to use for the dataset.', choices=['cpu', 'cuda'])
 args = parser.parse_args()
 
 dtype = torch.float32
@@ -141,7 +143,7 @@ if args.train_mode == 'new':
 
     # Import data and RBM model
     fname_data = utilities.catch_file(main_repo='data', message='Insert the filename of the dataset: ')
-    train_dataset = RBMdataset(args.data, dataset='train', partial_labels=args.partial_labels, lab_frac=args.lab_frac, dtype=dtype)
+    train_dataset = RBMdataset(args.data, dataset='train', partial_labels=args.partial_labels, lab_frac=args.lab_frac, dtype=dtype, device=args.device_dataset)
     
     Nv = train_dataset.get_num_visibles()
     rbm = RBM(num_visible=Nv, num_hidden=args.Nh, num_categ=train_dataset.get_num_categs(), device=device, dtype=dtype)
