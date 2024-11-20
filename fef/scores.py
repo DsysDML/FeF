@@ -1,44 +1,51 @@
+from typing import Tuple, Dict, Callable
 import torch
 from torch.nn import MSELoss
 import numpy as np
 import gzip
+from adabmDCA.stats import get_freq_single_point as get_freq_single_point_cat
+from adabmDCA.stats import get_freq_two_points as get_freq_two_points_cat
+from annadca.binary.stats import get_freq_single_point as get_freq_single_point_bin
+from annadca.binary.stats import get_freq_two_points as get_freq_two_points_bin
 
-def LL_score_Ssl(D : torch.Tensor, G : torch.Tensor, rbm) -> torch.Tensor:
-    """Computes the difference between the unnormalized Log-Likelihoods of the data D and the generated samples G according to the rbm model.
 
-    Args:
-        D (torch.Tensor): Data matrix of shape (# samples, Nv).
-        LD (torch.Tensor): Labels associated with the data.
-        G (torch.Tensor): Generated samples matrix of shape (# samples, Nv).
-        LG (torch.Tensor): Labels associated with the generated samples.
-        rbm (RBM) : RBM model.
+from fef.rbms import fefRBM
 
-    Returns:
-        torch.Tensor: MSE of the Log-Likelihoods.
-    """
-    
-    LLD = torch.mean(rbm.compute_energy_visibles(D))
-    LLG = torch.mean(rbm.compute_energy_visibles(G))
-    
-    return (LLG / LLD - 1.)**2
-
-def AAI_score(D : torch.Tensor, G : torch.Tensor) -> torch.Tensor:
-    """Computes the Adversarial Accuracy Indicator (AAI) scores of the data D and the generated samples G.
-    In case of categorical variables, the input matrices must be the one-hot representations of the original ones.
+def LL_score(
+    rbm: fefRBM,
+    data: torch.Tensor,
+    gen: torch.Tensor,
+    labels: torch.Tensor,
+) -> float:
+    """Computes the difference between the Log-Likelihoods of the data and the generated samples
+    according to the rbm model.
 
     Args:
-        D (torch.Tensor): Data matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
-        G (torch.Tensor): Generated samples matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
+        rbm (fefRBM): RBM model.
+        data (torch.Tensor): Data matrix.
+        gen (torch.Tensor): Generated samples.
 
     Returns:
-        list: (AAI_data, AAI_generated) scores.
+        float: MSE of the Log-Likelihoods.
     """
     
-    conc = torch.cat([torch.round(D), torch.round(G)], 0) # If data are continuous, turn them into binary variables
+    ll_data = rbm.compute_energy_visibles(visible=data, label=labels).mean().item()
+    ll_gen = rbm.compute_energy_visibles(visible=gen, label=labels).mean().item()
+    
+    return (ll_gen / ll_data - 1.)**2
+
+
+@torch.jit.script
+def _AAI_score(
+    data: torch.Tensor,
+    gen: torch.Tensor,
+) -> Tuple[float, float]:
+    conc = torch.cat([data, gen], 0)
+    # all-to-all distance matrix
     dAB = torch.cdist(conc, conc, p=0)
     torch.diagonal(dAB).fill_(float('inf'))
 
-    # the next line is use to tranform the matrix
+    # the next line is used to tranform the matrix
     #  d_TT d_TF   INTO d_TF- d_TT-  where the minus indicate a reverse order of the columns
     #  d_FT d_FF        d_FT  d_FF
     dAB[:dAB.shape[0] // 2, :] = torch.flip(dAB[:int(dAB.shape[0] / 2),:], dims=[1])
@@ -46,191 +53,141 @@ def AAI_score(D : torch.Tensor, G : torch.Tensor) -> torch.Tensor:
     n = int(closest.shape[0] / 2)
 
     # correctly_classified = closest >= n
-    AAdata = (closest[:n] >= n).sum() / n  # for a true sample, prob that the closest is in the set of true samples
-    AAgen = (closest[n:] >= n).sum() / n  # for a fake sample, prob that the closest is in the set of fake samples
+    AAI_data = (closest[:n] >= n).sum() / n  # for a true sample, prob that the closest is in the set of true samples
+    AAI_gen = (closest[n:] >= n).sum() / n  # for a fake sample, prob that the closest is in the set of fake samples
 
-    return AAdata, AAgen
+    return (AAI_data.item(), AAI_gen.item())
 
-def spectrum_score(D : torch.Tensor, G : torch.Tensor) -> torch.Tensor:
-    """Computes the MSE between the spectra of the data D and the generated samples G.
-    In case of categorical variables, the input matrices must be the one-hot representations of the original ones.
+def AAI_score(
+    data: torch.Tensor,
+    gen: torch.Tensor,
+) -> Tuple[float, float]:
+    """Computes the Adversarial Accuracy Indicator (AAI) scores of the data and the generated samples.
 
     Args:
-        D (torch.Tensor): Data matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
-        G (torch.Tensor): Generated samples matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
+        data (torch.Tensor): Data matrix.
+        gen (torch.Tensor): Generated samples.
+        
+    Returns:
+        Tuple[float, float]: AAI scores:
+            AAI_data: for a true sample, prob that the closest is in the set of true samples.
+            AAI_gen: for a fake sample, prob that the closest is in the set of fake samples.
+    """
+    return _AAI_score(data, gen)
+
+
+def spectrum_score(
+    spectrum_data: torch.Tensor,
+    gen: torch.Tensor,
+) -> float:
+    """Computes the MSE between the spectra of the data and the generated samples matrices.
+
+    Args:
+        spectrum_data (torch.Tensor): Eigenvalues of the data matrix.
+        gen (torch.Tensor): Generated samples.
 
     Returns:
-        torch.Tensor: MSE of the spectra.
+        float: MSE between the two spectra.
     """
-    N = torch.tensor(G.shape[0])
-    spectrum_D = torch.linalg.svdvals(D - D.type(torch.float32).mean(0)) * torch.pow(N, -0.5)
-    spectrum_G = torch.linalg.svdvals(G - G.type(torch.float32).mean(0)) * torch.pow(N, -0.5)
+    num_samples = gen.shape[0]
+    gen = gen.view(num_samples, -1)
+    spectrum_gen = torch.linalg.svdvals(gen - gen.mean(0)).square() / num_samples
     
-    return MSELoss()(spectrum_D, spectrum_G)
+    return MSELoss()(spectrum_data, spectrum_gen).item()
 
-def entropy_score(entropy_D : float, G : torch.Tensor):
+
+def entropy_score(
+    entropy_data: float,
+    gen: torch.Tensor,
+) -> float:
     """
-    Computes the entropy score.
+    Computes the entropy score of the generated samples.
     
     Args:
-        entropy_D (float): Entropy-per-sample of the data.
-        G (torch.Tensor): Generated samples.
+        entropy_data (float): Per-sample entropy of the data.
+        gen (torch.Tensor): Generated samples.
+        
+    Returns:
+        float: Entropy score.
     """
-    entropy_G = len(gzip.compress(G.int().cpu().numpy())) / len(G)
-
-    score = (entropy_G / entropy_D) - 1.
+    entropy_gen = len(gzip.compress(gen.int().cpu().numpy())) / len(gen)
+    score = (entropy_gen / entropy_data) - 1.
     
     return score
     
-def first_moment_score(D : torch.Tensor, G : torch.Tensor) -> torch.Tensor:
-    """Computes the MSE between the frequences of the data D and the generated samples G.
-    In case of categorical variables, the input matrices must be the one-hot representations of the original ones.
+    
+def first_moment_score(
+    fi_data: torch.Tensor,
+    gen: torch.Tensor,
+) -> float:
+    """Computes the MSE between the single-point frequences of the data and the generated samples.
 
     Args:
-        D (torch.Tensor): Data matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
-        G (torch.Tensor): Generated samples matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
+        fi_data (torch.Tensor): Single-point frequences of the data.
+        gen (torch.Tensor): Generated samples.
 
     Returns:
-        torch.Tensor: MSE of the frequences.
+        float: MSE of the single-point frequences.
     """
+    if fi_data.dim() == 1:
+        fi_gen = get_freq_single_point_bin(gen, weights=None, pseudocount=1e-8)
+    elif fi_data.dim() == 2:
+        fi_gen = get_freq_single_point_cat(gen, weights=None, pseudocount=1e-8)
+    else:
+        raise ValueError("The input data must be either binary or one-hot for categorical.")
     
-    fD = D.type(torch.float32).mean(0)
-    fG = G.type(torch.float32).mean(0)
-    
-    return MSELoss()(fD, fG)
+    return MSELoss()(fi_data, fi_gen).item()
 
-def second_moment_score(D : torch.Tensor, G : torch.Tensor) -> torch.Tensor:
-    """Computes the MSE between the covariance matrix of the data D and the generated samples G.
-    The covariance matrices are computed one row at a time in order to fit the memory contraints.
-    In case of categorical variables, the input matrices must be the one-hot representations of the original ones.
+
+def second_moment_score(
+    cov_data: torch.Tensor,
+    gen: torch.Tensor,
+) -> float:
+    """Computes the MSE between the two-point frequences of the data and the generated samples.
 
     Args:
-        D (torch.Tensor): Data matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
-        G (torch.Tensor): Generated samples matrix of shape (# samples, Nv) if binary, and (# samples, Nv * num_states) if categorical.
+        cov_data (torch.Tensor): Covariance matrix of the data.
+        gen (torch.Tensor): Generated samples.
 
     Returns:
-        torch.Tensor: MSE of the two covariance matrcies.
+        float: MSE of the two-point frequences.
     """
+    if cov_data.dim() == 2:
+        fi_gen = get_freq_single_point_bin(gen, weights=None, pseudocount=1e-8)
+        fij_gen = get_freq_two_points_bin(gen, weights=None, pseudocount=1e-8)
+        cov_gen = fij_gen - torch.einsum('i,j->ij', fi_gen, fi_gen)
+    elif cov_data.dim() == 4:
+        fi_gen = get_freq_single_point_cat(gen, weights=None, pseudocount=1e-8)
+        fij_gen = get_freq_two_points_cat(gen, weights=None, pseudocount=1e-8)
+        cov_gen = fij_gen - torch.einsum('ij,kl->ijkl', fi_gen, fi_gen)
+    else:
+        raise ValueError("The input data must be either binary or one-hot for categorical.")
     
-    # center the datasets and take the transposed
-    DcT = (D - D.type(torch.float32).mean(0)).mT
-    GcT = (G - G.type(torch.float32).mean(0)).mT
-    N, M = D.shape
-    
-    l2_loss = 0.
-    for i in range(M):
-        CiD = DcT @ DcT[i].t() / (N - 1)
-        CiG = GcT @ GcT[i].t() / (N - 1)
-        l2_loss += MSELoss()(CiD, CiG) / M
-    
-    return l2_loss
+    return MSELoss()(cov_data, cov_gen).item()
 
-##############################################################################
-# Batched versions of the scores above
 
-def LL_score_batched(D : torch.Tensor, G : torch.Tensor, rbm, batch_size : int) -> torch.Tensor:
-    """Computes the difference between the unnormalized Log-Likelihoods of the data D and the generated samples G according to the rbm model.
-
-    Args:
-        D (torch.Tensor): Data matrix of shape (# samples, Nv).
-        G (torch.Tensor): Generated samples matrix of shape (# samples, Nv).
-        rbm (RBM) : RBM model.
-        batch_size (int): Batch size.
-
-    Returns:
-        torch.Tensor: MSE of the Log-Likelihoods.
-    """
-    LLD = []
-    LLG = []
-    
-    n_epochs = D.shape[0] // batch_size + 1
-    for ep in range(n_epochs):
-        D_ep = D[ep * batch_size : (ep + 1) * batch_size]
-        G_ep = G[ep * batch_size : (ep + 1) * batch_size]
-        LLD.append(torch.mean(rbm.compute_energy_visibles(D_ep)).unsqueeze(0))
-        LLG.append(torch.mean(rbm.compute_energy_visibles(G_ep)).unsqueeze(0))
-    LLG = torch.cat(LLG, 0).mean()
-    LLD = torch.cat(LLD, 0).mean()
-    
-    return (LLG / LLD - 1.)**2
-
-def LL_score_batched_Ssl(D : torch.Tensor, LD : torch.Tensor, G : torch.Tensor, LG : torch.Tensor, rbm, batch_size : int) -> torch.Tensor:
-    """Computes the difference between the unnormalized Log-Likelihoods of the data D and the generated samples G according to the rbm model.
-
-    Args:
-        D (torch.Tensor): Data matrix of shape (# samples, Nv).
-        LD (torch.Tensor): Labels associated with the data.
-        G (torch.Tensor): Generated samples matrix of shape (# samples, Nv).
-        LG (torch.Tensor): Labels associated with the generated samples.
-        rbm (RBM) : RBM model.
-        batch_size (int): Batch size.
-
-    Returns:
-        torch.Tensor: MSE of the Log-Likelihoods.
-    """
-    LLD = []
-    LLG = []
-    
-    n_epochs = D.shape[0] // batch_size + 1
-    for ep in range(n_epochs):
-        D_ep = D[ep * batch_size : (ep + 1) * batch_size]
-        LD_ep = LD[ep * batch_size : (ep + 1) * batch_size]
-        G_ep = G[ep * batch_size : (ep + 1) * batch_size]
-        LG_ep = LG[ep * batch_size : (ep + 1) * batch_size]
-        LLD.append(torch.mean(rbm.compute_energy_visibles(D_ep, LD_ep)).unsqueeze(0))
-        LLG.append(torch.mean(rbm.compute_energy_visibles(G_ep, LG_ep)).unsqueeze(0))
-    LLG = torch.cat(LLG, 0).mean()
-    LLD = torch.cat(LLD, 0).mean()
-    
-    return (LLG / LLD - 1.)**2
-
-class SCORE():
-    
-    def __init__(self, t_ages : np.ndarray, record_times : np.ndarray, labels : np.ndarray) -> None:
+class Score():
+    def __init__(
+        self,
+        checkpoints: np.ndarray | list | None = None,
+        record_times: np.ndarray | list | None = None,
+        labels: np.ndarray | list | None = None,
+        score_function: Callable | None = None,
+) -> None:
         
-        self.t_ages = t_ages
+        self.checkpoints = checkpoints
         self.record_times = record_times
         self.labels = labels
-        self.n_labels = len(labels)
-        self.mean_temp = 0
-        self.counter = 0
-        self.score_timeline = {t : {l : [] for l in self.labels} for t in self.t_ages}
-        self.mean = {t : [] for t in self.t_ages}
+        self.score_function = score_function
+        
+    def load(self, filename : str) -> None:
+        pass
+    
+    def save(self, filename : str) -> None:
+        pass
 
-    def update(self, t_age : int, label : str, value : float) -> None:
-        
-        self.mean_temp += value
-        self.score_timeline[t_age][label].append(value)
-        self.counter += 1
-        if self.counter == self.n_labels:
-            self.mean[t_age].append(self.mean_temp / self.n_labels)
-            self.counter = 0
-            self.mean_temp = 0
-            
-    def get_label_score(self, t_age : int, label : str) -> list:
-        
-        return self.score_timeline[t_age][label]
-    
-    def get_mean_score(self, t_age : int) -> list:
-        
-        return self.mean[t_age]
-    
-
-class SCORE_SINGLE():
-    
-    def __init__(self, t_ages : np.ndarray, record_times : np.ndarray) -> None:
-        
-        self.t_ages = t_ages
-        self.record_times = record_times
-        self.mean = {t : [] for t in self.t_ages}
-
-    def update(self, t_age : int, value : float) -> None:
-        
-        self.mean[t_age].append(value)
-    
-    def get_mean_score(self, t_age : int) -> list:
-        
-        return self.mean[t_age]
+    def update(self, checkpoint : int, score : float) -> None:
+        pass
             
             
             
