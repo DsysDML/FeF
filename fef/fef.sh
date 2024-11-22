@@ -4,7 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Check if the first positional argument is provided
 if [ -z "$1" ]; then
-  echo "Error: No command provided. Use 'train'."
+  echo "Error: No command provided. Use 'train' or 'score'."
   exit 1
 fi
 
@@ -17,8 +17,11 @@ case "$COMMAND" in
   train)
     SCRIPT="train.py"
     ;;
+  score)
+    SCRIPT="score.py"
+    ;;
   *)
-    echo "Error: Invalid command '$COMMAND'. Use 'train'."
+    echo "Error: Invalid command '$COMMAND'. Use 'train' or 'score'."
     exit 1
     ;;
 esac

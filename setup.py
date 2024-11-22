@@ -32,6 +32,7 @@ setup(
         'pandas==2.2.3',
         'torch==2.5.1',
         'tqdm==4.67.0',
-        'adabmDCA==0.1.5'
+        'scikit-learn==1.5.2',
+        'adabmDCA==0.1.5',
     ],
 )

@@ -6,7 +6,7 @@ sys.path.append(os.getcwd() + '/src')
 sys.path.append(os.getcwd() + '/src/RBMs')
 from BernoulliBernoulliSslRBM import RBM
 import torch
-import scores
+import fef.scores as scores
 import argparse
 import utilities
 from h5py import File

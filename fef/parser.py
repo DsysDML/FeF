@@ -35,8 +35,12 @@ def add_args_score(parser : argparse.ArgumentParser) -> argparse.ArgumentParser:
     fef_args.add_argument("-p", "--path_params",  type=Path,  required=True,        help="Path to the file containing the model's parameters.")
     fef_args.add_argument("-l", "--label",        type=str,   default=None,         help="(Defaults to None). If provoded, adds a label to the output files inside the output folder.")
     fef_args.add_argument("-t", "--gen_time",     type=int,   default=10000,        help="(Defaults to 10000) Number of Alternating Gibbs Steps for the generation of the sequences.")
-    fef_args.add_argument("--num_checkpoints",    type=int,   default=50,           help='(Defaults to 50). Number of score evaluations along the sampling trajectory.')
+    fef_args.add_argument("-w", "--weights",      type=Path,  default=None,         help="(Defaults to None). Path to the file containing the weights of the sequences. If None, the weights are computed automatically.")
+    fef_args.add_argument("--num_records",        type=int,   default=10,           help='(Defaults to 10). Number of score evaluations along the sampling trajectory.')
+    fef_args.add_argument("--checkpoints",        type=str,   default=None,         help="(Defaults to None). If provoded, adds a label to the output files inside the output folder.")
     fef_args.add_argument("--alphabet",           type=str,   default="protein",    help="(Defaults to protein). Type of encoding for the sequences. Choose among ['protein', 'rna', 'dna'] or a user-defined string of tokens.")
+    fef_args.add_argument("--seed",               type=int,   default=0,            help="(Defaults to 0). Seed for the random number generator.")
+    fef_args.add_argument("--use_latex",          action="store_true",              help="(Defaults to False). If specified, the the font of the plots will use the LaTeX graphics.")
     fef_args.add_argument("--dtype",              type=str,   default="float32",    help="(Defaults to float32). Data type to be used.", choices=["float32", "float64"])
     fef_args.add_argument("--device",             type=str,   default="cuda",       help="(Defaults to cuda). Device to be used.")
     

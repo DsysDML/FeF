@@ -44,6 +44,7 @@ if __name__ == '__main__':
     device = get_device(args.device)
     print("\n")
     print(f"Input data:\t\t{args.data}")
+    print(f"Input annotations:\t{args.annotations}")
     print(f"Output folder:\t\t{args.output}")
     print(f"Number of hidden units:\t{args.hidden}")
     print(f"Learning rate:\t\t{args.lr}")
