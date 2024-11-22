@@ -71,7 +71,7 @@ if __name__ == '__main__':
         dtype=args.dtype,
     )
     tokens = get_tokens(dataset.alphabet)
-    print(f"Alphabet: {dataset.alphabet}")
+    print(f"Alphabet: {dataset.alphabet}")        
     
     # Create the folder where to save the model
     folder = Path(args.output)
@@ -95,13 +95,16 @@ if __name__ == '__main__':
             path.unlink()
             
     # Save the weights if not already provided
-    if args.weights is None:
+    if args.weights is None and args.use_weights:
         if args.label is not None:
             path_weights = folder / f"{args.label}_weights.dat"
         else:
             path_weights = folder / "weights.dat"
         np.savetxt(path_weights, dataset.weights.cpu().numpy())
         print(f"Weights saved in {path_weights}")
+    elif not args.use_weights:
+        dataset.weights = torch.ones_like(dataset.weights)
+        print("All sequence weights are set to 1")
         
     # Set the random seed
     torch.manual_seed(args.seed)
