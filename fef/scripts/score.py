@@ -183,6 +183,7 @@ if __name__ == '__main__':
     score_second_moment = Score(checkpoints=chpts, record_times=record_times, labels=unique_labels, score_function=scores.second_moment_score)
     score_accuracy = Score(checkpoints=chpts, record_times=record_times, labels=unique_labels, score_function=get_accuracy)
     confusion_matrices = {}
+    samples = {checkpoint: {} for checkpoint in chpts}
     
     for checkpoint in chpts:
         print(f"\nEvaluating the model at checkpoint {checkpoint}...")
@@ -221,24 +222,54 @@ if __name__ == '__main__':
                     score_AAI_data.evaluate(label=label, checkpoint=checkpoint, record_time=t, AAI_scores=scores_AAI)
                     score_AAI_gen.evaluate(label=label, checkpoint=checkpoint, record_time=t, AAI_scores=scores_AAI)
                     score_accuracy.evaluate(label=label, checkpoint=checkpoint, record_time=t, target=dataset.to_label(labels_one_hot[mask]), prediction=dataset.to_label(chains_predict["label"][mask]))
+                samples[checkpoint][t] = chains_gen["visible"].cpu().numpy()
         predictions = dataset.to_label(chains_predict["label"].cpu().numpy())
         confusion_matrices[checkpoint] = confusion_matrix(targets, predictions, normalize="true")
+        
     # Save the scores
-    score_ll.save(folder_scores / Path("log_likelihood.h5"))
-    score_spectrum.save(folder_scores / Path("spectrum.h5"))
-    score_entropy.save(folder_scores / Path("entropy.h5"))
-    score_first_moment.save(folder_scores / Path("first_moment.h5"))
-    score_second_moment.save(folder_scores / Path("second_moment.h5"))
-    score_AAI_data.save(folder_scores / Path("AAI_data.h5"))
-    score_AAI_gen.save(folder_scores / Path("AAI_gen.h5"))
-    score_accuracy.save(folder_scores / Path("accuracy.h5"))
-    with h5py.File(folder_scores / Path("confusion_matrices.h5"), "w") as f:
-        for checkpoint, confusion_matrix in confusion_matrices.items():
-            f.create_dataset(str(checkpoint), data=confusion_matrix)
+    if args.label is None:
+        score_ll.save(folder_scores / Path("log_likelihood.h5"))
+        score_spectrum.save(folder_scores / Path("spectrum.h5"))
+        score_entropy.save(folder_scores / Path("entropy.h5"))
+        score_first_moment.save(folder_scores / Path("first_moment.h5"))
+        score_second_moment.save(folder_scores / Path("second_moment.h5"))
+        score_AAI_data.save(folder_scores / Path("AAI_data.h5"))
+        score_AAI_gen.save(folder_scores / Path("AAI_gen.h5"))
+        score_accuracy.save(folder_scores / Path("accuracy.h5"))
+        with h5py.File(folder_scores / Path("confusion_matrices.h5"), "w") as f:
+            for checkpoint, confusion_matrix in confusion_matrices.items():
+                f.create_dataset(str(checkpoint), data=confusion_matrix)
+    else:
+        score_ll.save(folder_scores / Path(f"{args.label}_log_likelihood.h5"))
+        score_spectrum.save(folder_scores / Path(f"{args.label}_spectrum.h5"))
+        score_entropy.save(folder_scores / Path(f"{args.label}_entropy.h5"))
+        score_first_moment.save(folder_scores / Path(f"{args.label}_first_moment.h5"))
+        score_second_moment.save(folder_scores / Path(f"{args.label}_second_moment.h5"))
+        score_AAI_data.save(folder_scores / Path(f"{args.label}_AAI_data.h5"))
+        score_AAI_gen.save(folder_scores / Path(f"{args.label}_AAI_gen.h5"))
+        score_accuracy.save(folder_scores / Path(f"{args.label}_accuracy.h5"))
+        with h5py.File(folder_scores / Path(f"{args.label}_confusion_matrices.h5"), "w") as f:
+            for checkpoint, confusion_matrix in confusion_matrices.items():
+                f.create_dataset(str(checkpoint), data=confusion_matrix)
+                
+    # Save the samples
+    if args.label is None:
+        fname_samples = folder / Path("samples.h5")
+    else:
+        fname_samples = folder / Path(f"{args.label}_samples.h5")
+    with h5py.File(fname_samples, "w") as f:
+        for checkpoint, samples_checkpoint in samples.items():
+            f_checkpoint = f.create_group(str(checkpoint))
+            for record_time, samples_record_time in samples_checkpoint.items():
+                f_checkpoint.create_dataset(str(record_time), data=samples_record_time)
     
     # Plot the scores mean for the generation
+    if args.label is None:
+        filename_scores_mean = folder_plots / Path("scores_mean.png")
+    else:
+        filename_scores_mean = folder_plots / Path(f"{args.label}_scores_mean.png")
     plot_scores_mean(
-        filename=folder_plots / Path("scores_mean.png"),
+        filename=filename_scores_mean,
         score_ll=score_ll,
         score_spectrum=score_spectrum,
         score_entropy=score_entropy,
@@ -251,32 +282,48 @@ if __name__ == '__main__':
     # Compute and plot the eigenvalues of the weight matrix and label matrix
     updates, eigenvalues = get_eigenvalues_history(args.path_params, target_matrix="weight_matrix", device=device, dtype=dtype)
     updates, eigenvalues_labels = get_eigenvalues_history(args.path_params, target_matrix="label_matrix", device=device, dtype=dtype)
+    if args.label is None:
+        plot_eigenvalues_filename = folder_plots / Path("eigenvalues.png")
+    else:
+        plot_eigenvalues_filename = folder_plots / Path(f"{args.label}_eigenvalues.png")
     plot_eigenvalues(
-        filename=folder_plots / Path("eigenvalues.png"),
+        filename=plot_eigenvalues_filename,
         updates=updates,
         eigenvalues=eigenvalues,
         eigenvalues_labels=eigenvalues_labels,
     )
     
     # Plot the AAI scores
+    if args.label is None:
+        plot_AAI_scores_filename = folder_plots / Path("AAI_scores.png")
+    else:
+        plot_AAI_scores_filename = folder_plots / Path(f"{args.label}_AAI_scores.png")
     plot_AAI_scores(
-        filename=folder_plots / Path("AAI_scores.png"),
+        filename=plot_AAI_scores_filename,
         score_AAI_data=score_AAI_data,
         score_AAI_gen=score_AAI_gen,
     )
     
     # Plot the accuracies
+    if args.label is None:
+        filename_accuracies = folder_plots / Path("accuracy.png")
+    else:
+        filename_accuracies = folder_plots / Path(f"{args.label}_accuracy.png")
     plot_accuracies(
-        filename=folder_plots / Path("accuracy.png"),
+        filename=filename_accuracies,
         score_accuracy=score_accuracy,
     )
     
     # Plot the confusion matrices
     path_confusion_matrices = folder_plots / Path("confusion_matrices")
     path_confusion_matrices.mkdir(parents=True, exist_ok=True)
+    if args.label is None:
+        stem_confusion_matrices = path_confusion_matrices / Path(f"confusion_matrix")
+    else:
+        stem_confusion_matrices = path_confusion_matrices / Path(f"{args.label}_confusion_matrix")
     for checkpoint, confusion_matrix in confusion_matrices.items():
         plot_confusion_matrix(
-            filename=path_confusion_matrices / Path(f"confusion_matrix_{checkpoint}.png"),
+            filename=str(stem_confusion_matrices) + f"_{checkpoint}.png",
             confusion_matrix=confusion_matrix,
             checkpoint=checkpoint,
             labels=unique_labels,

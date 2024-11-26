@@ -31,7 +31,7 @@ def add_args_train(parser : argparse.ArgumentParser) -> argparse.ArgumentParser:
 def add_args_score(parser : argparse.ArgumentParser) -> argparse.ArgumentParser:
     fef_args = parser.add_argument_group("Scoring a fefRBM model.")
     fef_args.add_argument("-d", "--data",         type=Path,  required=True,        help="Filename of the dataset to be used for scoring the model.")
-    fef_args.add_argument("-o", "--output",       type=Path,  default="scoring",    help="(Defaults to 'scoring'). Path to the folder where to save the model.")
+    fef_args.add_argument("-o", "--output",       type=Path,  default="scoring",    help="(Defaults to 'scoring'). Path to the folder where to save the results of the analysis.")
     fef_args.add_argument("-a", "--annotations",  type=Path,  required=True,        help="Path to the file containing the annotations of the sequences.")
     fef_args.add_argument("-p", "--path_params",  type=Path,  required=True,        help="Path to the file containing the model's parameters.")
     fef_args.add_argument("-l", "--label",        type=str,   default=None,         help="(Defaults to None). If provoded, adds a label to the output files inside the output folder.")
