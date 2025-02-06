@@ -2,14 +2,14 @@ from typing import Dict
 import torch
 from abc import ABC, abstractmethod
 
-from annadca.binary import annaRBMbin
-from annadca.categorical import annaRBMcat
-from annadca.binary.sampling import _sample_hiddens as _sample_hiddens_bin
-from annadca.binary.sampling import _sample_visibles as _sample_visibles_bin
-from annadca.binary.sampling import _sample_labels as _sample_labels_bin
-from annadca.categorical.sampling import _sample_hiddens as _sample_hiddens_cat
-from annadca.categorical.sampling import _sample_visibles as _sample_visibles_cat
-from annadca.categorical.sampling import _sample_labels as _sample_labels_cat
+from annadca.rbm.binary import annaRBMbin
+from annadca.rbm.categorical import annaRBMcat
+from annadca.rbm.binary.sampling import _sample_hiddens as _sample_hiddens_bin
+from annadca.rbm.binary.sampling import _sample_visibles as _sample_visibles_bin
+from annadca.rbm.binary.sampling import _sample_labels as _sample_labels_bin
+from annadca.rbm.categorical.sampling import _sample_hiddens as _sample_hiddens_cat
+from annadca.rbm.categorical.sampling import _sample_visibles as _sample_visibles_cat
+from annadca.rbm.categorical.sampling import _sample_labels as _sample_labels_cat
 
 class fefRBM(ABC):
     """Abstract class for the F&F Restricted Boltzmann Machine"""

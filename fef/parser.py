@@ -1,14 +1,13 @@
 import argparse
 from pathlib import Path
 
-def add_args_train(parser : argparse.ArgumentParser) -> argparse.ArgumentParser:
+def add_args_fef(parser : argparse.ArgumentParser) -> argparse.ArgumentParser:
     fef_args = parser.add_argument_group("Training a fefRBM model.")
     fef_args.add_argument("-d", "--data",         type=Path,  required=True,        help="Filename of the dataset to be used for training the model.")
     fef_args.add_argument("-o", "--output",       type=Path,  default="fefRBM",     help="(Defaults to fefRBM). Path to the folder where to save the model.")
     fef_args.add_argument("-a", "--annotations",  type=Path,  required=True,        help="Path to the file containing the annotations of the sequences.")
     fef_args.add_argument("-H", "--hidden",       type=int,   default=100,          help="(Defaults to 100). Number of hidden units.")
     # Optional arguments
-    fef_args.add_argument("-w", "--weights",      type=Path,  default=None,         help="(Defaults to None). Path to the file containing the weights of the sequences. If None, the weights are computed automatically.")
     fef_args.add_argument("-p", "--path_params",  type=Path,  default=None,         help="(Defaults to None) Path to the file containing the model's parameters. Required for restoring the training.")
     fef_args.add_argument("-l", "--label",        type=str,   default=None,         help="(Defaults to None). If provoded, adds a label to the output files inside the output folder.")
     fef_args.add_argument("--alphabet",           type=str,   default="protein",    help="(Defaults to protein). Type of encoding for the sequences. Choose among ['protein', 'rna', 'dna'] or a user-defined string of tokens.")
@@ -27,11 +26,25 @@ def add_args_train(parser : argparse.ArgumentParser) -> argparse.ArgumentParser:
     
     return parser
 
+def add_args_reweighting(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    reweighting_args = parser.add_argument_group("Sequence reweighting arguments")
+    reweighting_args.add_argument("-w", "--weights",      type=Path,  default=None,  help="(Defaults to None). Path to the file containing the weights of the sequences. If None, the weights are computed automatically.")
+    reweighting_args.add_argument("--no_reweighting",     action="store_true",       help="(Defaults to False). If provided, the reweighting of the sequences is not performed.")
+    reweighting_args.add_argument("--clustering_seqid",   type=float, default=0.8,   help="(Defaults to 0.8). Sequence Identity threshold for clustering. Used only if 'weights' is not provided.")
+
+    return parser
+
+def add_args_train(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser = add_args_fef(parser)
+    parser = add_args_reweighting(parser)
+    
+    return parser
+
 
 def add_args_score(parser : argparse.ArgumentParser) -> argparse.ArgumentParser:
     fef_args = parser.add_argument_group("Scoring a fefRBM model.")
     fef_args.add_argument("-d", "--data",         type=Path,  required=True,        help="Filename of the dataset to be used for scoring the model.")
-    fef_args.add_argument("-o", "--output",       type=Path,  default="scoring",    help="(Defaults to 'scoring'). Path to the folder where to save the results of the analysis.")
+    fef_args.add_argument("-o", "--output",       type=Path,  default="scoring",    help="(Defaults to 'scoring'). Path to the folder where to save the model.")
     fef_args.add_argument("-a", "--annotations",  type=Path,  required=True,        help="Path to the file containing the annotations of the sequences.")
     fef_args.add_argument("-p", "--path_params",  type=Path,  required=True,        help="Path to the file containing the model's parameters.")
     fef_args.add_argument("-l", "--label",        type=str,   default=None,         help="(Defaults to None). If provoded, adds a label to the output files inside the output folder.")

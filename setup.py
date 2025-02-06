@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='fef',
-    version='0.0.1',
+    version='0.1.0',
     author='Lorenzo Rosset, Alessandra Carbone, Aurélien Decelle, Beatriz Seoane',
     maintainer='Lorenzo Rosset',
     author_email='rosset.lorenzo@gmail.com',
@@ -27,12 +27,6 @@ setup(
         ],
     },
     install_requires=[
-        'matplotlib==3.9.2',
-        'numpy==2.1.3',
-        'pandas==2.2.3',
-        'torch==2.5.1',
-        'tqdm==4.67.0',
-        'scikit-learn==1.5.2',
-        'adabmDCA==0.1.5',
+        'annadca>=0.1.0',
     ],
 )
